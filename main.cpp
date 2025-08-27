@@ -4,15 +4,57 @@
 #include <string>
 #include <vector>
 #include <sstream>
-#include <unistd.h> // For fork(), execvp(), execlp(), waitpid()
+#include <unistd.h> // For fork(), execvp(), execlp(), waitpid(), open(), close()
 #include <sys/wait.h> // For waitpid()
+#include <sys/stat.h> // For mkdir()
+#include <fcntl.h> // For O_NOFOLLOW
+#include <errno.h> // For errno
+#include <zlib.h> // For zlib
+#include <minizip/unzip.h> // For minizip
 #include <iostream>
 
 // Define a static version ID to avoid __DATE__ and __TIME__
-// Alternatively, define VERSION_ID via build system, e.g., -DVERSION_ID="2025.08.26"
 #ifndef VERSION_ID
 #define VERSION_ID "1.0.0"
 #endif
+
+// Function to validate if path is under /tmp/
+bool is_allowed_path(const std::string& path) {
+    if (path.empty() || path[0] != '/') {
+        return false;
+    }
+    // Check for /tmp/ prefix
+    return path == "/tmp" || path.rfind("/tmp/", 0) == 0;
+}
+
+// Function to sanitize zip entry path and construct safe destination path
+std::string get_safe_destination_path(const std::string& entry_name) {
+    // Remove leading slashes and check for dangerous components
+    std::string safe_name = entry_name;
+    while (!safe_name.empty() && safe_name[0] == '/') {
+        safe_name.erase(0, 1);
+    }
+    if (safe_name.find("..") != std::string::npos || safe_name.empty()) {
+        return "";
+    }
+    // Construct full path under /data/local/tmp/
+    return "/data/local/tmp/" + safe_name;
+}
+
+// Function to create directories for a given path
+bool create_directories(const std::string& path, mode_t mode) {
+    std::string current_path;
+    std::stringstream ss(path);
+    std::string component;
+    while (std::getline(ss, component, '/')) {
+        if (component.empty()) continue;
+        current_path += "/" + component;
+        if (mkdir(current_path.c_str(), mode) == -1 && errno != EEXIST) {
+            return false;
+        }
+    }
+    return true;
+}
 
 // Function to display help message
 void display_help() {
@@ -20,7 +62,7 @@ void display_help() {
     printf("Supported commands:\n");
     printf("- wifi <subcommand> [args...] : Execute Wi-Fi commands (e.g., wifi start-scan)\n");
     printf("- logcat                      : Dump logcat output to stdout\n");
-    printf("- splash <path>               : Placeholder command (does nothing)\n");
+    printf("- splash <path>               : Extract zip file at <path> (e.g., /tmp/screen.zip) to /data/local/tmp/\n");
     printf("- shell                       : Drop into an interactive shell\n");
     printf("- version                     : Display version ID\n");
     printf("- help                        : Display this help message\n");
@@ -128,7 +170,101 @@ int main(int argc, char* argv[]) {
             display_help();
             return 1;
         }
-        // Do nothing for now
+        std::string zip_path = cmd_args[0];
+        // Validate path
+        if (!is_allowed_path(zip_path)) {
+            printf("Error: Path must be in /tmp/ (e.g., /tmp/screen.zip)\n");
+            return 1;
+        }
+        // Check if file exists and is accessible (avoid symlink attacks)
+        int fd = open(zip_path.c_str(), O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+        if (fd == -1) {
+            perror("Error: Cannot access zip file");
+            return 1;
+        }
+        close(fd);
+        // Ensure destination directory exists
+        if (mkdir("/data/local/tmp", 0775) == -1 && errno != EEXIST) {
+            perror("Error: Cannot create /data/local/tmp");
+            return 1;
+        }
+        // Open zip file with minizip
+        unzFile zip = unzOpen64(zip_path.c_str());
+        if (!zip) {
+            printf("Error: Failed to open zip file: %s\n", zip_path.c_str());
+            return 1;
+        }
+        // Iterate through zip entries
+        for (int ret = unzGoToFirstFile(zip); ret == UNZ_OK; ret = unzGoToNextFile(zip)) {
+            char entry_name[PATH_MAX];
+            unz_file_info64 file_info;
+            if (unzGetCurrentFileInfo64(zip, &file_info, entry_name, sizeof(entry_name), nullptr, 0, nullptr, 0) != UNZ_OK) {
+                unzClose(zip);
+                printf("Error: Failed to get zip entry info\n");
+                return 1;
+            }
+            // Sanitize entry name and construct destination path
+            std::string dest_path = get_safe_destination_path(entry_name);
+            if (dest_path.empty()) {
+                unzClose(zip);
+                printf("Error: Invalid or unsafe zip entry: %s\n", entry_name);
+                return 1;
+            }
+            // Check if entry is a directory
+            if (entry_name[strlen(entry_name) - 1] == '/') {
+                // Directory: create it
+                if (!create_directories(dest_path, 0775)) {
+                    unzClose(zip);
+                    printf("Error: Failed to create directory: %s\n", dest_path.c_str());
+                    return 1;
+                }
+                continue;
+            }
+            // File: create parent directories and extract
+            std::string parent_dir = dest_path.substr(0, dest_path.find_last_of('/'));
+            if (!create_directories(parent_dir, 0775)) {
+                unzClose(zip);
+                printf("Error: Failed to create parent directory: %s\n", parent_dir.c_str());
+                return 1;
+            }
+            // Open zip entry
+            if (unzOpenCurrentFile(zip) != UNZ_OK) {
+                unzClose(zip);
+                printf("Error: Failed to open zip entry: %s\n", entry_name);
+                return 1;
+            }
+            // Open destination file
+            int out_fd = open(dest_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+            if (out_fd == -1) {
+                unzCloseCurrentFile(zip);
+                unzClose(zip);
+                perror("Error: Failed to open destination file");
+                return 1;
+            }
+            // Read and write file contents
+            char buffer[8192];
+            int bytes_read;
+            while ((bytes_read = unzReadCurrentFile(zip, buffer, sizeof(buffer))) > 0) {
+                if (write(out_fd, buffer, bytes_read) != bytes_read) {
+                    close(out_fd);
+                    unzCloseCurrentFile(zip);
+                    unzClose(zip);
+                    perror("Error: Failed to write to destination file");
+                    return 1;
+                }
+            }
+            if (bytes_read < 0) {
+                close(out_fd);
+                unzCloseCurrentFile(zip);
+                unzClose(zip);
+                printf("Error: Failed to read zip entry: %s\n", entry_name);
+                return 1;
+            }
+            close(out_fd);
+            unzCloseCurrentFile(zip);
+        }
+        unzClose(zip);
+        printf("Successfully extracted %s to /data/local/tmp/\n", zip_path.c_str());
         return 0;
     } else {
         printf("Unknown or restricted command: %s\n", command.c_str());

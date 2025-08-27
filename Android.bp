@@ -1,13 +1,23 @@
 cc_binary {
     name: "restricted_shell",
-    srcs: ["main.cpp"],
-    shared_libs: [
-        "liblog",
-        "libcutils",
-        "libbase",
+    srcs: [
+        "main.cpp",
+        "minizip/unzip.c",
+        "minizip/ioapi.c",
     ],
     cflags: [
         "-Wall",
         "-Werror",
+        "-D__ANDROID__",
     ],
+    shared_libs: [
+        "libbase",
+        "liblog",
+        "libcutils",
+        "libz",
+    ],
+    include_dirs: [
+        "external/restricted_shell/minizip", // For unzip.h
+    ],
+    installable: true,
 }
