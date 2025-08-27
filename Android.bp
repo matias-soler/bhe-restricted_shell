@@ -1,0 +1,13 @@
+cc_binary {
+    name: "restricted_shell",
+    srcs: ["main.cpp"],
+    shared_libs: [
+        "liblog",
+        "libcutils",
+        "libbase",
+    ],
+    cflags: [
+        "-Wall",
+        "-Werror",
+    ],
+}
